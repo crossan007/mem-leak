@@ -1,0 +1,21 @@
+#!/usr/bin/env bpftrace
+// Attribute 64-byte kmalloc allocations to their call site and report how many
+// were freed within the sample window. A steady leaker shows alloc ≈ outstanding.
+// Usage: sudo bpftrace kmalloc64-leakers.bt | tee kmalloc64-leakers-$(date +%F-%H%M).txt
+
+config = { max_map_keys = 500000 }
+
+tracepoint:kmem:kmalloc /args.bytes_alloc == 64/ {
+    @site[args.ptr] = args.call_site;
+    @alloc[ksym(args.call_site)] = count();
+}
+
+tracepoint:kmem:kfree /has_key(@site, args.ptr)/ {
+    @freed[ksym(@site[args.ptr])] = count();
+    delete(@site, args.ptr);
+}
+
+interval:s:15 {
+    clear(@site);
+    exit();
+}
