@@ -16,7 +16,13 @@ The leak was caught live on boot `d05a2542-9029-4773-9e22-af94ca9fa00a`:
 | Growth rate | ~7.8 MiB / 30 s, linear (≈ 4,400 leaked allocations/s) |
 | Leak window | 2026-10-28 17:22:49 → 2026-10-29 08:34:32 |
 
-Since the leak stopped, `SUnreclaim` has been flat at ~15.0 GB. The memory was **not** freed when the greeter process exited, so a reboot is needed to recover it.
+After the leak stopped, `SUnreclaim` stayed flat at ~15.0 GB. The memory was **not** freed when the greeter process exited; only a reboot recovered it.
+
+**Current state (boot `87cd5481`, rebooted 2026-10-29 08:48):**
+
+- No kernel leak this boot. `SUnreclaim` is ~0.6 GiB, rising ~20 MiB/h.
+- A 32-minute **static** lock with the Deck streaming did **not** leak (Finding 6). The trigger is still unknown; it probably needs continuous rendering while locked.
+- The plasmashell `sync_file` fd leak is worked around with `__NV_DISABLE_EXPLICIT_SYNC=1`. This is a **standing configuration change** that persists across reboots and is inherited by apps launched from Plasma (Finding 4).
 
 Evidence (not included in this repository; the relevant figures are quoted in this document):
 
@@ -120,7 +126,16 @@ Other processes also hold `sync_file` fds; at 09:06, 188 in total for this user.
 Environment=__NV_DISABLE_EXPLICIT_SYNC=1
 ```
 
-With it, a hover creates one `sync_file` that is closed when the hover ends, and the count stays flat at ~13. The leaked fds are therefore the fences egl-wayland creates for `wp_linux_drm_syncobj_v1` on each swap, not anything in Qt or Plasma. To undo: `systemctl --user revert plasma-plasmashell.service`, then restart plasmashell. Firefox still runs with explicit sync and still leaks; restarting it clears its fds.
+With it, a hover creates one `sync_file` that is closed when the hover ends, and the count stays flat at ~13. The leaked fds are therefore the fences egl-wayland creates for `wp_linux_drm_syncobj_v1` on each swap, not anything in Qt or Plasma.
+
+**This is a standing configuration change, and it spreads:**
+
+- The drop-in persists: every login and reboot starts plasmashell with the variable.
+- Apps launched from the panel, menu or KRunner **inherit** plasmashell's environment. Confirmed with Firefox: relaunched from Plasma at 16:54 (PID 309680, unit `app-firefox@….service`), it had the variable without it being set for Firefox, and started with ~6 `sync_file` fds. Whether Firefox stays flat under scrolling/video is still to be checked.
+- Not affected: apps started before plasmashell picked it up, autostart apps, apps launched from a terminal that predates it, and systemd services (KWin, Sunshine).
+- Readings taken with the override active must not be read as "the fd leak is fixed upstream".
+
+To undo: `systemctl --user revert plasma-plasmashell.service`, then restart plasmashell and relaunch the affected apps.
 
 ### 5. A Steam Deck virtual monitor was being streamed for the whole leak
 
@@ -167,8 +182,8 @@ Not yet confirmed:
 
 ## Next steps
 
-1. **Reboot** to recover the ~14 GB. Capture evidence first if anything new is needed.
-2. **Reproduce on purpose.** Each run: lock the screen, wake it so the greeter shows, and leave it ~5 minutes without unlocking. Watch `tail -f ~/.local/state/memwatch/memwatch-$(cat /proc/sys/kernel/random/boot_id).v2.csv`; `SUnreclaim` is column 6, and the `Locked`, `Greeter` and `DeckVm` columns record the conditions.
+1. ~~**Reboot** to recover the ~14 GB.~~ Done 2026-10-29 08:48.
+2. **Reproduce on purpose.** Note whether the plasmashell `__NV_DISABLE_EXPLICIT_SYNC=1` drop-in was active and how the animating app was launched (Finding 4): the leak night ran **without** the override, so a test with it in place is a different condition. If an animated lock does not leak, revert the drop-in, launch the animating app from a terminal, and repeat. Each run: lock the screen, wake it so the greeter shows, and leave it ~5 minutes without unlocking. Watch `tail -f ~/.local/state/memwatch/memwatch-$(cat /proc/sys/kernel/random/boot_id).v2.csv`; `SUnreclaim` is column 6, and the `Locked`, `Greeter` and `DeckVm` columns record the conditions.
 
    Test A with a static lock screen was negative (Finding 6), so repeat it with something animating on the lock screen, e.g. music playing in Tidal so the media controls update, or the greeter kept visible with the screens on. Check with `./status.sh` (the "Lock episodes" section).
 
@@ -185,7 +200,7 @@ Not yet confirmed:
    ```
    The leaker will show ~66k `@alloc` in 15 s with few or no `@freed`. If the top suspect is `dma_fence_allocate_private_stub` (whose frees may be invisible to the tracepoint), follow up with a `kstack` trace filtered on that call site to see which driver path calls it.
 4. **Work around it in the meantime:** end the Moonlight session before locking or walking away. That runs the stop script and removes the virtual output. Otherwise, unlock promptly. The monitor's `deck_while_locked` alert reminds you of this.
-5. **Report upstream** once confirmed: NVIDIA (driver 580.178.04) and/or KDE (kscreenlocker / KWin 6.6.6 explicit sync / screencast of virtual outputs). Mention Sunshine `capture = kwin` with `krfb-virtualmonitor`. Attach the slabinfo, trace and CSV.
+5. **Report upstream.** Done so far: data posted on #1331 and egl-wayland #196 (see "Upstream reports"). Still to do: post the leaking call site to #1331 once traced, and file with KDE (KWin 6.6.6 explicit sync / screencast of virtual outputs) if the trigger turns out to be on the KWin side. Mention Sunshine `capture = kwin` with `krfb-virtualmonitor`.
 6. **Check driver updates** for an NVIDIA release that fixes explicit-sync fence leaks.
 
 ## Upstream reports
@@ -244,8 +259,8 @@ Thresholds (KiB unless noted; each can be overridden via environment):
 | `sunreclaim_rate` | `SUnreclaim` rose > `SUNRECLAIM_RATE_KIB=262144` (256 MiB) over `SUNRECLAIM_RATE_WINDOW_SEC=1800` | ALERT + notify. This catches the greeter leak (~7.5 GiB/30 min) within ~30 min of onset. |
 | `slab_pressure` | `Slab > SLAB_ALERT=10000000` (~9.5 GiB) or `SUnreclaim > SUNRECLAIM_ALERT=8000000` (~7.6 GiB) | ALERT + notify |
 | `low_memavailable` | `MemAvailable < MEMAVAILABLE_ALERT=500000` (~488 MiB) | ALERT + notify |
-| `plasmashell_fds` | plasmashell open fds ≥ `FD_ALERT_PCT=80`% of its soft limit | ALERT + notify; the message includes the restart command |
-| `deck_while_locked` | `DeckVm=1` and (`Locked=1` or `Greeter=1`) | ALERT + notify: "disconnect Moonlight". Based on the unconfirmed hypothesis; disable with `DECK_LOCK_ALERT=0`. |
+| `plasmashell_fds` | plasmashell open fds ≥ `FD_ALERT_PCT=80`% of its soft limit | ALERT + notify; the message includes the restart command. Should rarely fire while the `__NV_DISABLE_EXPLICIT_SYNC=1` drop-in is in place. |
+| `deck_while_locked` | `DeckVm=1` and (`Locked=1` or `Greeter=1`) | ALERT + notify: "disconnect Moonlight". Based on the unconfirmed hypothesis; a static lock with the Deck streaming did not leak (Finding 6). Disable with `DECK_LOCK_ALERT=0`. |
 | trends | Slab / SUnreclaim rise or MemAvailable fall > `TREND_DELTA=2000000` over the last 8 samples | log only |
 
 ### Deployment history (2026-10-28)
@@ -270,7 +285,8 @@ These were prompted by the leak: the old monitor first alerted 7.5 h after onset
 ### Known limitations
 
 - Monitor power state is not tracked: sysfs `dpms` reports `On` even for disconnected connectors on this driver, so it is unreliable.
-- Whether a Sunshine session is active is not tracked directly. `DeckVm` stands in for it, because the prep commands tie the virtual output to sessions.
+- Whether a Moonlight client is connected and pulling frames is not tracked directly. `DeckVm` stands in for it, because the prep commands tie the virtual output to sessions, but it only shows that the output exists. A column from Sunshine's log or API would close this gap.
+- Whether anything is rendering on the lock screen (media controls, animated wallpaper, screens on) is not tracked, and Finding 6 suggests it matters.
 - The monitor cannot see per-cache growth, because `/proc/slabinfo` is root-only (mode 0400). If needed, add a separate root timer that logs the top 5 slab caches by size every few minutes. Track them by size rank, not by fixed name, since the `kmalloc-rnd-NN` names change every boot.
 
 ## Files in this directory
