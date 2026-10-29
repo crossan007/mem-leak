@@ -53,6 +53,12 @@ if [[ -f "$CSV" ]]; then
         $1, g($2), g($6), g($10), g($4), g($11-$12), ($14==""?"-":$14), $15, $16, $18, $19, $22, $21, $24 }
   ' "$ROWS"
 
+  section "Last 10 samples (SUnreclaim delta per sample; leak night was ~+8000 KiB)"
+  tail -11 "$ROWS" | awk -F, '
+    BEGIN { printf "%-19s %10s %8s  L G D  %5s %5s %5s\n", "ts","SUnrec_KiB","dKiB","PsFd","PsSyn","GpuMi" }
+    NR>1 { printf "%-19s %10d %+8d  %s %s %s  %5s %5s %5s\n", $1, $6, $6-p, ($14==""?"-":$14), $15, $16, $18, $19, $24 }
+    { p=$6 }'
+
   section "Rates"
   last=$(tail -1 "$ROWS")
   IFS=, read -r -a L <<< "$last"
