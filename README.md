@@ -102,7 +102,25 @@ To recover the shell without rebooting, run `systemctl --user restart plasma-pla
 
 After the 2026-10-29 reboot, with the Deck streaming, plasmashell's `sync_file` count grew at ~2.4/min: 40 at 08:50, 54 at 08:55, 66 at 09:01, 74 at 09:06. The previous plasmashell averaged ~0.6/min over its lifetime.
 
-Other processes also hold `sync_file` fds; at 09:06, 188 in total for this user. Firefox (51), Telegram (17) and VS Code (14) hold the most after plasmashell. Whether those grow is not yet known; `UserSyncFiles` in the CSV tracks the total.
+Other processes also hold `sync_file` fds; at 09:06, 188 in total for this user. Firefox (51), Telegram (17) and VS Code (14) hold the most after plasmashell. `UserSyncFiles` in the CSV tracks the total.
+
+**The leak is per frame rendered, not per unit of time** (2026-10-29, plasmashell PID 5964, 7.5 h of 30 s samples):
+
+- `sync_file` fds went from 40 to 601, out of 770 fds total. Every other fd type (eventfd, sockets, `/dev/nvidia*`, inotify, caches) stayed stable.
+- 88% of samples showed no change. Growth came in bursts of ~10–50, matching popup, notification and tooltip animations; the unlock at 14:05 alone added 19.
+- During a 32-minute screen lock, growth was exactly zero.
+- Hovering a task-manager entry added 1–5 `sync_file` fds per hover, never closed.
+- Firefox showed the same pattern (51 → 475 over the same period), so this is any EGL Wayland client, not Plasma specifically.
+
+**`__NV_DISABLE_EXPLICIT_SYNC=1` fixes it for plasmashell.** It was set via a systemd drop-in and plasmashell was restarted at 16:44 (PID 302882):
+
+```ini
+# ~/.config/systemd/user/plasma-plasmashell.service.d/override.conf
+[Service]
+Environment=__NV_DISABLE_EXPLICIT_SYNC=1
+```
+
+With it, a hover creates one `sync_file` that is closed when the hover ends, and the count stays flat at ~13. The leaked fds are therefore the fences egl-wayland creates for `wp_linux_drm_syncobj_v1` on each swap, not anything in Qt or Plasma. To undo: `systemctl --user revert plasma-plasmashell.service`, then restart plasmashell. Firefox still runs with explicit sync and still leaks; restarting it clears its fds.
 
 ### 5. A Steam Deck virtual monitor was being streamed for the whole leak
 
@@ -119,6 +137,21 @@ The stream alone did not leak, though. For ~32 h before 17:22 it was active and 
 
 A plausible mechanism (not verified): when the session is locked, the physical monitors power off, but a virtual output has no power state. KWin may therefore keep rendering the lock screen at 60 Hz into the screencast all night. A small per-frame leak on the lock-screen render path would not show up during normal desktop use.
 
+### 6. A static locked screen with the stream active did not leak (2026-10-29)
+
+Boot `87cd5481`, with Moonlight streaming continuously since shortly after boot:
+
+| Lock | Duration | `DeckVm` | `SUnreclaim` before → peak → after unlock |
+|---|---|---|---|
+| 13:30:11 | < 1 min | 1 | 557.4 → 559.2 → 557.5 MiB |
+| 13:32:12 → 14:04:31 | 32 min | 1 | 557.1 → 558.4 → 558.4 MiB |
+
+- The physical monitors powered off during the 32-minute lock: GPU memory stepped down from 3.3 GB to 2.1 GB at 13:36, 13:42 and 13:50, and powerdevil logged the monitors' DDC/i2c devices reappearing at the 14:04 unlock.
+- The machine was effectively idle: `sync_file` counts did not move, and `SUnreclaim` changed by a few KiB per sample.
+- On the leak night onset came ~22 s after the greeter appeared, so 32 minutes is a fair negative. Lock + greeter + stream is **not sufficient**.
+
+The leak night's ~4,400 objects/s (~70 per frame at 60 Hz) means something kept frames coming all night, whereas today's lock screen was static. Since both the kernel leak and the plasmashell fd leak (Finding 4) scale with frames rendered, the missing factor is probably **continuous rendering while locked**: for example lock-screen media controls updating, an animated wallpaper, or the greeter staying visible with the screens on.
+
 ## Hypothesis
 
 While the Plasma 6.6.6 lock-screen greeter is on screen **and** the `Virtual-deck-vm` output is being screencast to the Steam Deck through KWin and PipeWire, each frame leaks DRM explicit-sync kernel objects. These are most likely 64-byte `dma_fence` objects, allocated through the `nvidia-drm` / `drm_syncobj` path on NVIDIA 580.178.04 under Wayland, and they are never released. They are not tied to the greeter's file descriptors, because they survive the process exiting.
@@ -130,16 +163,18 @@ Not yet confirmed:
 - which exact function makes the leaked allocations
 - whether the leak is in `nvidia-drm` / `nvidia-modeset`, core DRM syncobj / dma-fence code, or the KWin screencast path
 - whether the trigger is the stream (Sunshine screencast) or just the virtual output existing
-- whether the trigger is the greeter being shown, or the session being locked at all. The `Locked` and `Greeter` columns will separate these, since it is not yet known whether `kscreenlocker_greet` runs for the whole lock or only once the screen is woken.
+- what kept frames rendering on the leak night. A static lock with the stream active did not leak (Finding 6). `kscreenlocker_greet` runs for the whole lock, so `Locked` and `Greeter` do not separate "locked" from "greeter visible".
 
 ## Next steps
 
 1. **Reboot** to recover the ~14 GB. Capture evidence first if anything new is needed.
 2. **Reproduce on purpose.** Each run: lock the screen, wake it so the greeter shows, and leave it ~5 minutes without unlocking. Watch `tail -f ~/.local/state/memwatch/memwatch-$(cat /proc/sys/kernel/random/boot_id).v2.csv`; `SUnreclaim` is column 6, and the `Locked`, `Greeter` and `DeckVm` columns record the conditions.
 
+   Test A with a static lock screen was negative (Finding 6), so repeat it with something animating on the lock screen, e.g. music playing in Tidal so the media controls update, or the greeter kept visible with the screens on. Check with `./status.sh` (the "Lock episodes" section).
+
    | Test | Deck stream | Virtual output | Expected if the hypothesis is right |
    |---|---|---|---|
-   | A | connected | on | leaks ~8 MiB per 30 s sample |
+   | A | connected | on | leaks ~8 MiB per 30 s sample (static lock: **no leak**, 2026-10-29) |
    | B | disconnected in Moonlight (stop script runs) | off | no leak |
    | C | disconnected | on (run `~/.config/sunshine/deck-vm-start.sh` by hand) | separates "stream" from "virtual output exists" |
 
@@ -166,6 +201,7 @@ Not yet confirmed:
   - Reported still present on 580.x.
   - Fixes: 590.44.01+ with egl-wayland2 reportedly fixes it, but reports are mixed. Maxwell is believed to be limited to 580, so this upgrade is likely unavailable.
   - Workarounds: `__NV_DISABLE_EXPLICIT_SYNC=1` (for plasmashell), restarting plasmashell, or Plasma software rendering.
+  - **`__NV_DISABLE_EXPLICIT_SYNC=1` confirmed to fix it here, and our data was posted 2026-10-29:** [comment](https://github.com/NVIDIA/egl-wayland/issues/196#issuecomment-6507971319) (per-frame bursts, hover test, before/after). See Finding 4.
 
 ## Monitor
 
@@ -241,6 +277,7 @@ These were prompted by the leak: the old monitor first alerted 7.5 h after onset
 
 - `memwatch-service.sh` — **source of truth** for the service: installs `~/.local/bin/memwatch.sh` (from its heredoc) and `~/.config/systemd/user/memwatch.service`
 - `memwatch.sh` — **not the service script.** An older (Sep 11) standalone foreground monitor that samples every 5s with per-slab-class detail and writes `memwatch-<timestamp>.log` / `.alerts.log` to the current directory. It has no `notify-send`. Its hard-coded slab names (`kmalloc-rnd-15-64` etc.) are only valid for the boot they were taken from. It has the same filename as the installed script, which caused confusion; consider renaming it (e.g. `memwatch-foreground.sh`).
+- `status.sh` — read-only one-shot status report (no root): service health, alerts, CSV timeline, last 10 samples, lock episodes, rates and plasmashell fd-limit projection, live meminfo, top RSS processes, and top `sync_file` holders. Run `./status.sh`.
 - `kmalloc64-leakers.bt` — bpftrace script that attributes 64-byte kmalloc allocations to call sites and counts frees within 15 s. Run as root.
 - `README.md` — canonical summary for this investigation
 
