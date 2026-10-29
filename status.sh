@@ -59,6 +59,26 @@ if [[ -f "$CSV" ]]; then
     NR>1 { printf "%-19s %10d %+8d  %s %s %s  %5s %5s %5s\n", $1, $6, $6-p, ($14==""?"-":$14), $15, $16, $18, $19, $24 }
     { p=$6 }'
 
+  section "Lock episodes (Locked=1 or Greeter=1; SUnreclaim before -> peak -> after unlock)"
+  # Leak night: ~+940 MiB/h while locked, never released after unlock.
+  awk -F, '
+    function t(s) { gsub(/[-:]/, " ", s); return mktime(s) }
+    function flush() {
+      if (!on) return
+      dur = (t(last_ts) - t(start_ts)) / 60
+      printf "%-19s -> %-8s %6.1f min  D=%s  before %7.1f  peak %7.1f  after %7s MiB  rate %+7.1f MiB/h  sync %s->%s\n",
+        start_ts, substr(last_ts, 12), dur, deck, before/1024, peak/1024,
+        (after == "" ? "(locked)" : sprintf("%7.1f", after/1024)),
+        (dur > 0 ? (peak - before) / 1024 / dur * 60 : 0), sync0, sync1
+    }
+    { lk = ($14 == 1 || $15 == 1) }
+    lk && !on { on = 1; start_ts = $1; before = prev_sun; peak = $6; deck = $16; sync0 = $19; after = "" }
+    lk { last_ts = $1; if ($6 > peak) peak = $6; if ($16 == 1) deck = 1; sync1 = $19 }
+    !lk && on { after = $6; flush(); on = 0 }
+    { prev_sun = $6 }
+    END { flush(); if (!seen_any && NR == 0) print "none" }
+  ' "$ROWS"
+
   section "Rates"
   last=$(tail -1 "$ROWS")
   IFS=, read -r -a L <<< "$last"
