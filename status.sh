@@ -107,8 +107,9 @@ if [[ -f "$CSV" ]]; then
     BEGIN {
       if (dt <= 0 || b <= a || lim == "") { print "plasmashell projection: n/a"; exit }
       r = (b-a)/dt; alert = lim*pct/100
+      if (r*3600 < 5) { printf "plasmashell projection: n/a (fd growth %.1f/h is not a leak)\n", r*3600; exit }
       ta = now + (alert-b)/r; tl = now + (lim-b)/r
-      ("date -d @" int(ta) " +%a\\ %H:%M") | getline sa; ("date -d @" int(tl) " +%a\\ %H:%M") | getline sl
+      ("date -d @" int(ta) " +%a\\ %F\\ %H:%M") | getline sa; ("date -d @" int(tl) " +%a\\ %F\\ %H:%M") | getline sl
       printf "plasmashell projection: %d-fd alert ~%s, %d limit ~%s\n", alert, (b>=alert?"now":sa), lim, sl
     }'
 else

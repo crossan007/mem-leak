@@ -131,7 +131,7 @@ With it, a hover creates one `sync_file` that is closed when the hover ends, and
 **This is a standing configuration change, and it spreads:**
 
 - The drop-in persists: every login and reboot starts plasmashell with the variable.
-- Apps launched from the panel, menu or KRunner **inherit** plasmashell's environment. Confirmed with Firefox: relaunched from Plasma at 16:54 (PID 309680, unit `app-firefox@….service`), it had the variable without it being set for Firefox, and started with ~6 `sync_file` fds. Whether Firefox stays flat under scrolling/video is still to be checked.
+- Apps launched from the panel, menu or KRunner **inherit** plasmashell's environment. Confirmed with Firefox: relaunched from Plasma at 16:54 (PID 309680, unit `app-firefox@….service`), it had the variable without it being set for Firefox, and started with ~6 `sync_file` fds. After 31 minutes including heavy scrolling (Facebook) it held 10, versus ~1/min before the workaround, so the workaround fixes Firefox too. At 18:11 both were still flat: plasmashell 13 after ~1.5 h (≈ +90 expected without the workaround) and Firefox 13 after ~1.3 h (≈ +75 expected). Facebook also felt smoother, but the restart (the old Firefox had a 3.5–5.7 GiB content process and the system was swapping) is a confound.
 - Not affected: apps started before plasmashell picked it up, autostart apps, apps launched from a terminal that predates it, and systemd services (KWin, Sunshine).
 - Readings taken with the override active must not be read as "the fd leak is fixed upstream".
 
